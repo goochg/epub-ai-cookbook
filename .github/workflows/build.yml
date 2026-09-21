@@ -88,6 +88,12 @@ jobs:
           print(f"Converted: {len(good)}")
           print(f"Skipped:   {len(failed)}")
 
+          if failed:
+              print()
+              print("Skipped notebooks:")
+              for filename, error in failed:
+                  print(f"  {filename}: {error}")
+
           if not good:
               raise SystemExit("No notebooks were converted")
           PY
@@ -97,25 +103,38 @@ jobs:
           SHA=$(git -C cookbook rev-parse HEAD)
           DATE=$(git -C cookbook show -s --format=%cs HEAD)
 
-          cat > intro.md <<EOF
-          # OpenAI Cookbook
+          python <<PY
+          import nbformat
+
+          nb = nbformat.v4.new_notebook()
+
+          nb.cells.append(
+              nbformat.v4.new_markdown_cell(
+                  """# OpenAI Cookbook
 
           Kindle edition generated from the OpenAI Cookbook.
 
           **Upstream version:** $DATE
 
-          **Commit:** $SHA
+          **Commit:** \`$SHA\`
 
           This ebook was automatically generated from the Jupyter
           notebooks in the OpenAI Cookbook repository.
-          EOF
+          """
+              )
+          )
+
+          nbformat.write(nb, "intro.ipynb")
+          PY
 
       - name: Build EPUB
         run: |
           mapfile -t NOTEBOOKS < notebooks.txt
 
+          echo "Building EPUB from ${#NOTEBOOKS[@]} notebooks..."
+
           pandoc \
-            intro.md \
+            intro.ipynb \
             "${NOTEBOOKS[@]}" \
             -f ipynb \
             -t epub3 \
@@ -126,6 +145,8 @@ jobs:
             --metadata author="OpenAI" \
             -o OpenAI-Cookbook.epub
 
+          echo
+          echo "EPUB created:"
           ls -lh OpenAI-Cookbook.epub
 
       - name: Upload Kindle EPUB
@@ -133,4 +154,5 @@ jobs:
         with:
           name: OpenAI-Cookbook-Kindle
           path: OpenAI-Cookbook.epub
+          if-no-files-found: error
           retention-days: 30
