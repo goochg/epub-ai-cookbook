@@ -1,0 +1,136 @@
+name: Build Kindle Cookbook
+
+on:
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  build:
+    runs-on: ubuntu-latest
+
+    steps:
+      - name: Checkout OpenAI Cookbook
+        uses: actions/checkout@v4
+        with:
+          repository: openai/openai-cookbook
+          path: cookbook
+
+      - name: Set up Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+
+      - name: Install tools
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y pandoc
+          python -m pip install nbformat
+
+      - name: Normalise notebooks
+        run: |
+          mkdir -p cleaned
+
+          python <<'PY'
+          from pathlib import Path
+          import nbformat
+
+          source = Path("cookbook")
+          destination = Path("cleaned")
+
+          good = []
+          failed = []
+
+          notebooks = sorted(
+              list((source / "articles").rglob("*.ipynb")) +
+              list((source / "examples").rglob("*.ipynb"))
+          )
+
+          print(f"Found {len(notebooks)} notebooks")
+
+          for notebook in notebooks:
+              relative = notebook.relative_to(source)
+
+              if ".ipynb_checkpoints" in relative.parts:
+                  continue
+
+              target = destination / relative
+              target.parent.mkdir(parents=True, exist_ok=True)
+
+              try:
+                  nb = nbformat.read(notebook, as_version=4)
+
+                  # Remove notebook metadata that isn't useful on Kindle.
+                  nb.metadata = {}
+
+                  for cell in nb.cells:
+                      cell.metadata = {}
+
+                      if cell.cell_type == "code":
+                          cell.execution_count = None
+
+                  nbformat.write(nb, target)
+
+                  good.append(str(target))
+                  print("OK  ", relative)
+
+              except Exception as error:
+                  failed.append((str(relative), str(error)))
+                  print("SKIP", relative, error)
+
+          Path("notebooks.txt").write_text(
+              "\n".join(good),
+              encoding="utf-8"
+          )
+
+          print()
+          print(f"Converted: {len(good)}")
+          print(f"Skipped:   {len(failed)}")
+
+          if not good:
+              raise SystemExit("No notebooks were converted")
+          PY
+
+      - name: Create front page
+        run: |
+          SHA=$(git -C cookbook rev-parse HEAD)
+          DATE=$(git -C cookbook show -s --format=%cs HEAD)
+
+          cat > intro.md <<EOF
+          # OpenAI Cookbook
+
+          Kindle edition generated from the OpenAI Cookbook.
+
+          **Upstream version:** $DATE
+
+          **Commit:** $SHA
+
+          This ebook was automatically generated from the Jupyter
+          notebooks in the OpenAI Cookbook repository.
+          EOF
+
+      - name: Build EPUB
+        run: |
+          mapfile -t NOTEBOOKS < notebooks.txt
+
+          pandoc \
+            intro.md \
+            "${NOTEBOOKS[@]}" \
+            -f ipynb \
+            -t epub3 \
+            --standalone \
+            --toc \
+            --toc-depth=2 \
+            --metadata title="OpenAI Cookbook" \
+            --metadata author="OpenAI" \
+            -o OpenAI-Cookbook.epub
+
+          ls -lh OpenAI-Cookbook.epub
+
+      - name: Upload Kindle EPUB
+        uses: actions/upload-artifact@v4
+        with:
+          name: OpenAI-Cookbook-Kindle
+          path: OpenAI-Cookbook.epub
+          retention-days: 30
