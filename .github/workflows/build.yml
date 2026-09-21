@@ -9,6 +9,7 @@ permissions:
 jobs:
   build:
     runs-on: ubuntu-latest
+    timeout-minutes: 30
 
     steps:
       - name: Checkout OpenAI Cookbook
@@ -29,10 +30,10 @@ jobs:
           python -m pip install --upgrade pip
           python -m pip install nbformat
 
-          echo "Pandoc version:"
+          echo "Pandoc:"
           pandoc --version | head -1
 
-      - name: Normalise notebooks
+      - name: Prepare notebooks
         run: |
           mkdir -p cleaned
 
@@ -65,15 +66,52 @@ jobs:
               try:
                   nb = nbformat.read(notebook, as_version=4)
 
-                  # Remove notebook-level metadata that is not
-                  # useful in the Kindle edition.
+                  # Remove unnecessary notebook metadata.
                   nb.metadata = {}
 
                   for cell in nb.cells:
                       cell.metadata = {}
 
-                      if cell.cell_type == "code":
-                          cell.execution_count = None
+                      if cell.cell_type != "code":
+                          continue
+
+                      cell.execution_count = None
+
+                      # Trim exceptionally large textual outputs.
+                      for output in cell.get("outputs", []):
+                          if output.get("output_type") == "stream":
+                              text = output.get("text", "")
+
+                              if isinstance(text, list):
+                                  text = "".join(text)
+
+                              if len(text) > 10000:
+                                  output["text"] = (
+                                      text[:10000]
+                                      + "\n\n[Output truncated for Kindle edition]"
+                                  )
+
+                          data = output.get("data", {})
+
+                          if isinstance(data, dict):
+                              for key in [
+                                  "text/plain",
+                                  "text/markdown",
+                                  "text/html"
+                              ]:
+                                  value = data.get(key)
+
+                                  if isinstance(value, list):
+                                      value = "".join(value)
+
+                                  if (
+                                      isinstance(value, str)
+                                      and len(value) > 10000
+                                  ):
+                                      data[key] = (
+                                          value[:10000]
+                                          + "\n\n[Output truncated for Kindle edition]"
+                                      )
 
                   nbformat.write(nb, target)
 
@@ -85,26 +123,27 @@ jobs:
                   print("SKIP", relative, error)
 
           Path("notebooks.txt").write_text(
-              "\n".join(good),
+              "\n".join(good) + "\n",
+              encoding="utf-8"
+          )
+
+          Path("prepare-failures.txt").write_text(
+              "\n".join(
+                  f"{filename}: {error}"
+                  for filename, error in failed
+              ),
               encoding="utf-8"
           )
 
           print()
-          print("Normalisation summary")
-          print("---------------------")
-          print(f"Found:     {len(notebooks)}")
-          print(f"Converted: {len(good)}")
-          print(f"Skipped:   {len(failed)}")
-
-          if failed:
-              print()
-              print("Skipped notebooks:")
-              for filename, error in failed:
-                  print(f"  {filename}")
-                  print(f"    {error}")
+          print("Preparation summary")
+          print("-------------------")
+          print(f"Found:    {len(notebooks)}")
+          print(f"Prepared: {len(good)}")
+          print(f"Failed:   {len(failed)}")
 
           if not good:
-              raise SystemExit("No notebooks were converted")
+              raise SystemExit("No notebooks could be prepared")
           PY
 
       - name: Convert notebooks to Markdown
@@ -113,8 +152,11 @@ jobs:
 
           SUCCESS=0
           FAILED=0
+          TIMED_OUT=0
+
           : > markdown-files.txt
           : > failed-notebooks.txt
+          : > timed-out-notebooks.txt
 
           while IFS= read -r NOTEBOOK
           do
@@ -125,45 +167,67 @@ jobs:
 
             mkdir -p "$(dirname "$OUTPUT")"
 
+            echo
+            echo "========================================"
             echo "Converting: $RELATIVE"
+            echo "========================================"
 
-            if pandoc \
+            set +e
+
+            timeout 30s pandoc \
               "$NOTEBOOK" \
               -f ipynb \
               -t markdown \
               --wrap=none \
               -o "$OUTPUT"
-            then
+
+            RESULT=$?
+
+            set -e
+
+            if [ "$RESULT" -eq 0 ]; then
               echo "$OUTPUT" >> markdown-files.txt
               SUCCESS=$((SUCCESS + 1))
+
+              echo "SUCCESS: $RELATIVE"
+
+            elif [ "$RESULT" -eq 124 ]; then
+              rm -f "$OUTPUT"
+
+              echo "$RELATIVE" >> timed-out-notebooks.txt
+              TIMED_OUT=$((TIMED_OUT + 1))
+
+              echo "TIMEOUT: $RELATIVE"
+
             else
+              rm -f "$OUTPUT"
+
               echo "$RELATIVE" >> failed-notebooks.txt
               FAILED=$((FAILED + 1))
-              echo "WARNING: Failed to convert $RELATIVE"
+
+              echo "FAILED: $RELATIVE (exit code $RESULT)"
             fi
+
           done < notebooks.txt
 
           echo
+          echo "========================================"
           echo "Markdown conversion summary"
-          echo "---------------------------"
+          echo "========================================"
           echo "Converted: $SUCCESS"
           echo "Failed:    $FAILED"
+          echo "Timed out: $TIMED_OUT"
 
           if [ "$SUCCESS" -eq 0 ]; then
             echo "No notebooks were successfully converted."
             exit 1
           fi
 
-          if [ "$FAILED" -gt 0 ]; then
-            echo
-            echo "Failed notebooks:"
-            cat failed-notebooks.txt
-          fi
-
       - name: Create front page
         run: |
           SHA=$(git -C cookbook rev-parse HEAD)
           DATE=$(git -C cookbook show -s --format=%cs HEAD)
+          COUNT=$(wc -l < markdown-files.txt)
 
           cat > intro.md <<EOF
           # OpenAI Cookbook
@@ -173,6 +237,8 @@ jobs:
           **Upstream version:** $DATE
 
           **Upstream commit:** \`$SHA\`
+
+          **Notebooks included:** $COUNT
 
           This ebook was automatically generated from the Jupyter
           notebooks in the OpenAI Cookbook repository.
@@ -184,7 +250,7 @@ jobs:
         run: |
           mapfile -t MARKDOWN_FILES < markdown-files.txt
 
-          echo "Building EPUB from ${#MARKDOWN_FILES[@]} converted notebooks..."
+          echo "Building EPUB from ${#MARKDOWN_FILES[@]} notebooks..."
 
           pandoc \
             intro.md \
@@ -203,25 +269,42 @@ jobs:
           echo "EPUB successfully created:"
           ls -lh OpenAI-Cookbook.epub
 
-      - name: Build report
+      - name: Create build report
         if: always()
         run: |
           {
-            echo "# OpenAI Cookbook EPUB Build"
+            echo "# OpenAI Cookbook EPUB Build Report"
             echo
             echo "Build date: $(date -u)"
             echo
             echo "Upstream commit: $(git -C cookbook rev-parse HEAD 2>/dev/null || echo unknown)"
             echo
-            echo "Notebooks found: $(wc -l < notebooks.txt 2>/dev/null || echo 0)"
-            echo "Markdown converted: $(wc -l < markdown-files.txt 2>/dev/null || echo 0)"
+            echo "Prepared notebooks: $(wc -l < notebooks.txt 2>/dev/null || echo 0)"
+            echo "Converted notebooks: $(wc -l < markdown-files.txt 2>/dev/null || echo 0)"
             echo "Failed conversions: $(wc -l < failed-notebooks.txt 2>/dev/null || echo 0)"
-            echo
+            echo "Timed-out conversions: $(wc -l < timed-out-notebooks.txt 2>/dev/null || echo 0)"
+
+            if [ -s timed-out-notebooks.txt ]; then
+              echo
+              echo "## Timed-out notebooks"
+              echo
+              cat timed-out-notebooks.txt
+            fi
+
             if [ -s failed-notebooks.txt ]; then
+              echo
               echo "## Failed notebooks"
               echo
               cat failed-notebooks.txt
             fi
+
+            if [ -s prepare-failures.txt ]; then
+              echo
+              echo "## Preparation failures"
+              echo
+              cat prepare-failures.txt
+            fi
+
           } > build-report.md
 
           cat build-report.md
@@ -242,6 +325,8 @@ jobs:
           name: OpenAI-Cookbook-Build-Report
           path: |
             build-report.md
+            prepare-failures.txt
             failed-notebooks.txt
+            timed-out-notebooks.txt
           if-no-files-found: ignore
           retention-days: 30
