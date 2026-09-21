@@ -26,7 +26,11 @@ jobs:
         run: |
           sudo apt-get update
           sudo apt-get install -y pandoc
+          python -m pip install --upgrade pip
           python -m pip install nbformat
+
+          echo "Pandoc version:"
+          pandoc --version | head -1
 
       - name: Normalise notebooks
         run: |
@@ -61,7 +65,8 @@ jobs:
               try:
                   nb = nbformat.read(notebook, as_version=4)
 
-                  # Remove notebook metadata that isn't useful on Kindle.
+                  # Remove notebook-level metadata that is not
+                  # useful in the Kindle edition.
                   nb.metadata = {}
 
                   for cell in nb.cells:
@@ -85,6 +90,9 @@ jobs:
           )
 
           print()
+          print("Normalisation summary")
+          print("---------------------")
+          print(f"Found:     {len(notebooks)}")
           print(f"Converted: {len(good)}")
           print(f"Skipped:   {len(failed)}")
 
@@ -92,67 +100,148 @@ jobs:
               print()
               print("Skipped notebooks:")
               for filename, error in failed:
-                  print(f"  {filename}: {error}")
+                  print(f"  {filename}")
+                  print(f"    {error}")
 
           if not good:
               raise SystemExit("No notebooks were converted")
           PY
+
+      - name: Convert notebooks to Markdown
+        run: |
+          mkdir -p markdown
+
+          SUCCESS=0
+          FAILED=0
+          : > markdown-files.txt
+          : > failed-notebooks.txt
+
+          while IFS= read -r NOTEBOOK
+          do
+            [ -z "$NOTEBOOK" ] && continue
+
+            RELATIVE="${NOTEBOOK#cleaned/}"
+            OUTPUT="markdown/${RELATIVE%.ipynb}.md"
+
+            mkdir -p "$(dirname "$OUTPUT")"
+
+            echo "Converting: $RELATIVE"
+
+            if pandoc \
+              "$NOTEBOOK" \
+              -f ipynb \
+              -t markdown \
+              --wrap=none \
+              -o "$OUTPUT"
+            then
+              echo "$OUTPUT" >> markdown-files.txt
+              SUCCESS=$((SUCCESS + 1))
+            else
+              echo "$RELATIVE" >> failed-notebooks.txt
+              FAILED=$((FAILED + 1))
+              echo "WARNING: Failed to convert $RELATIVE"
+            fi
+          done < notebooks.txt
+
+          echo
+          echo "Markdown conversion summary"
+          echo "---------------------------"
+          echo "Converted: $SUCCESS"
+          echo "Failed:    $FAILED"
+
+          if [ "$SUCCESS" -eq 0 ]; then
+            echo "No notebooks were successfully converted."
+            exit 1
+          fi
+
+          if [ "$FAILED" -gt 0 ]; then
+            echo
+            echo "Failed notebooks:"
+            cat failed-notebooks.txt
+          fi
 
       - name: Create front page
         run: |
           SHA=$(git -C cookbook rev-parse HEAD)
           DATE=$(git -C cookbook show -s --format=%cs HEAD)
 
-          python <<PY
-          import nbformat
-
-          nb = nbformat.v4.new_notebook()
-
-          nb.cells.append(
-              nbformat.v4.new_markdown_cell(
-                  """# OpenAI Cookbook
+          cat > intro.md <<EOF
+          # OpenAI Cookbook
 
           Kindle edition generated from the OpenAI Cookbook.
 
           **Upstream version:** $DATE
 
-          **Commit:** \`$SHA\`
+          **Upstream commit:** \`$SHA\`
 
           This ebook was automatically generated from the Jupyter
           notebooks in the OpenAI Cookbook repository.
-          """
-              )
-          )
 
-          nbformat.write(nb, "intro.ipynb")
-          PY
+          ---
+          EOF
 
       - name: Build EPUB
         run: |
-          mapfile -t NOTEBOOKS < notebooks.txt
+          mapfile -t MARKDOWN_FILES < markdown-files.txt
 
-          echo "Building EPUB from ${#NOTEBOOKS[@]} notebooks..."
+          echo "Building EPUB from ${#MARKDOWN_FILES[@]} converted notebooks..."
 
           pandoc \
-            intro.ipynb \
-            "${NOTEBOOKS[@]}" \
-            -f ipynb \
+            intro.md \
+            "${MARKDOWN_FILES[@]}" \
+            -f markdown \
             -t epub3 \
             --standalone \
             --toc \
             --toc-depth=2 \
             --metadata title="OpenAI Cookbook" \
             --metadata author="OpenAI" \
+            --metadata lang="en-GB" \
             -o OpenAI-Cookbook.epub
 
           echo
-          echo "EPUB created:"
+          echo "EPUB successfully created:"
           ls -lh OpenAI-Cookbook.epub
 
+      - name: Build report
+        if: always()
+        run: |
+          {
+            echo "# OpenAI Cookbook EPUB Build"
+            echo
+            echo "Build date: $(date -u)"
+            echo
+            echo "Upstream commit: $(git -C cookbook rev-parse HEAD 2>/dev/null || echo unknown)"
+            echo
+            echo "Notebooks found: $(wc -l < notebooks.txt 2>/dev/null || echo 0)"
+            echo "Markdown converted: $(wc -l < markdown-files.txt 2>/dev/null || echo 0)"
+            echo "Failed conversions: $(wc -l < failed-notebooks.txt 2>/dev/null || echo 0)"
+            echo
+            if [ -s failed-notebooks.txt ]; then
+              echo "## Failed notebooks"
+              echo
+              cat failed-notebooks.txt
+            fi
+          } > build-report.md
+
+          cat build-report.md
+
       - name: Upload Kindle EPUB
+        if: success()
         uses: actions/upload-artifact@v4
         with:
           name: OpenAI-Cookbook-Kindle
           path: OpenAI-Cookbook.epub
           if-no-files-found: error
+          retention-days: 30
+
+      - name: Upload build report
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: OpenAI-Cookbook-Build-Report
+          path: |
+            build-report.md
+            failed-notebooks.txt
+          if-no-files-found: ignore
           retention-days: 30
